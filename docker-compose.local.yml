@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # PostgreSQL для бота
   postgres:
@@ -107,15 +105,14 @@ services:
       args:
         # Бот внутри docker-сети
         CABINET_API_URL: "http://remnawave_bot:8080"
-        # Базовый путь до API для браузера (через nginx/Easypanel это будет /api)
+        # Базовый путь до API для браузера (через Easypanel это будет /api)
         VITE_API_URL: "/api"
         VITE_TELEGRAM_BOT_USERNAME: "${VITE_TELEGRAM_BOT_USERNAME}"
         VITE_APP_NAME: "${VITE_APP_NAME:-Cabinet}"
         VITE_APP_LOGO: "${VITE_APP_LOGO:-V}"
     container_name: cabinet_frontend
     restart: unless-stopped
-    env_file:
-      - ./cabinet/.env   # или просто .env, если так удобнее
+    # env_file убрали, чтобы не требовалось cabinet/.env
     ports:
       - "${CABINET_PORT:-3020}:80"
     healthcheck:
