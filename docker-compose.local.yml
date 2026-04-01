@@ -1,4 +1,7 @@
+version: "3.9"
+
 services:
+  # PostgreSQL для бота
   postgres:
     image: postgres:15-alpine
     container_name: remnawave_bot_db
@@ -7,23 +10,24 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-remnawave_bot}
       POSTGRES_USER: ${POSTGRES_USER:-remnawave_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
-      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - bot_network
-      - remnawave-network # Подключаем к сети панели
+      - remnawave-network
     healthcheck:
       test:
         [
-          'CMD-SHELL',
-          'pg_isready -U ${POSTGRES_USER:-remnawave_user} -d ${POSTGRES_DB:-remnawave_bot}',
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-remnawave_user} -d ${POSTGRES_DB:-remnawave_bot}",
         ]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 30s
 
+  # Redis для бота
   redis:
     image: redis:7-alpine
     container_name: remnawave_bot_redis
@@ -33,13 +37,14 @@ services:
       - redis_data:/data
     networks:
       - bot_network
-      - remnawave-network # Подключаем к сети панели
+      - remnawave-network
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test: ["CMD", "redis-cli", "ping"]
       interval: 30s
       timeout: 10s
       retries: 3
 
+  # Remnawave / Bedolaga бот
   bot:
     build: .
     container_name: remnawave_bot
@@ -52,58 +57,57 @@ services:
     env_file:
       - .env
     environment:
-      FORCE_COLOR: '1'
-      DOCKER_ENV: 'true'
-      DATABASE_MODE: 'auto'
-      POSTGRES_HOST: 'postgres'
-      POSTGRES_PORT: '5432'
-      POSTGRES_DB: '${POSTGRES_DB:-remnawave_bot}'
-      POSTGRES_USER: '${POSTGRES_USER:-remnawave_user}'
-      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:-secure_password_123}'
-      REDIS_URL: 'redis://redis:6379/0'
-      TZ: 'Europe/Moscow'
-      LOCALES_PATH: '${LOCALES_PATH:-/app/locales}'
+      FORCE_COLOR: "1"
+      DOCKER_ENV: "true"
+      DATABASE_MODE: "auto"
+
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: "${POSTGRES_DB:-remnawave_bot}"
+      POSTGRES_USER: "${POSTGRES_USER:-remnawave_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-secure_password_123}"
+
+      REDIS_URL: "redis://redis:6379/0"
+
+      TZ: "Europe/Moscow"
+      LOCALES_PATH: "${LOCALES_PATH:-/app/locales}"
+
     volumes:
       - ./logs:/app/logs:rw
       - ./data:/app/data:rw
       - ./locales:/app/locales:rw
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
       - ./uploads:/app/uploads:rw
       - ./vpn_logo.png:/app/vpn_logo.png:ro
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+
     ports:
-      - '${WEB_API_PORT:-8080}:8080'
+      - "${WEB_API_PORT:-8080}:8080"   # Web API наружу
+
     networks:
       - bot_network
-      - remnawave-network # Подключаем к сети панели
+      - remnawave-network
+
     healthcheck:
       test:
         [
-          'CMD-SHELL',
-          'python -c "import requests, os; requests.get(''http://localhost:8080/health'', headers={''X-API-Key'': os.environ.get(''WEB_API_DEFAULT_TOKEN'')}, timeout=5) or exit(1)"',
+          "CMD-SHELL",
+          "python -c \"import requests, os; requests.get('http://localhost:8080/health', headers={'X-API-Key': os.environ.get('WEB_API_DEFAULT_TOKEN')}, timeout=5) or exit(1)\"",
         ]
       interval: 60s
       timeout: 10s
       retries: 3
       start_period: 30s
 
-volumes:
-  postgres_data:
-    driver: local
-  redis_data:
-    driver: local
-
-networks:
-  bot_network:
-    driver: bridge
-#    ipam:
-#      config:
-#        - subnet: 172.20.0.0/16
-#          gateway: 172.20.0.1
-    driver_opts:
-      com.docker.network.driver.mtu: 1350
-
-  remnawave-network:
-    name: remnawave-network
-    driver: bridge
-#    external: true # Используем существующую сеть панели
+  # Frontend кабинета
+  cabinet-frontend:
+    build:
+      context: ./cabinet       # поправь, если директория другая
+      dockerfile: Dockerfile
+      args:
+        # Бот внутри docker-сети
+        CABINET_API_URL: "http://remnawave_bot:8080"
+        # Базовый путь до API для браузера (через nginx/Easypanel это будет /api)
+        VITE_API_URL: "/api"
+        VITE_TELEGRAM_BOT_USERNAME: "${VITE_TELEGRAM_BOT_USERNAME}"
+        VITE_APP_
