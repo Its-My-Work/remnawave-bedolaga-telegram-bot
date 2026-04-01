@@ -110,4 +110,38 @@ services:
         # Базовый путь до API для браузера (через nginx/Easypanel это будет /api)
         VITE_API_URL: "/api"
         VITE_TELEGRAM_BOT_USERNAME: "${VITE_TELEGRAM_BOT_USERNAME}"
-        VITE_APP_
+        VITE_APP_NAME: "${VITE_APP_NAME:-Cabinet}"
+        VITE_APP_LOGO: "${VITE_APP_LOGO:-V}"
+    container_name: cabinet_frontend
+    restart: unless-stopped
+    env_file:
+      - ./cabinet/.env   # или просто .env, если так удобнее
+    ports:
+      - "${CABINET_PORT:-3020}:80"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - remnawave-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  bot_network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1350
+
+  remnawave-network:
+    name: remnawave-network
+    driver: bridge
+    # если хочешь использовать сеть панели / других проектов,
+    # раскомментируй следующую строку и убери driver:
+    # external: true
