@@ -79,6 +79,25 @@ def get_effective_referral_commission_percent(user: User) -> int:
         )
         return max(0, min(100, settings.REFERRAL_COMMISSION_PERCENT))
 
+    # Проверяем временный множитель реферальной комиссии
+    multiplier = getattr(user, 'referral_multiplier', None)
+    multiplier_expires = getattr(user, 'referral_multiplier_expires_at', None)
+
+    if multiplier and multiplier > 1:
+        # Проверяем не истёк ли множитель
+        if multiplier_expires is None or multiplier_expires > datetime.now(UTC):
+            original_percent = percent
+            percent = min(100, percent * multiplier)
+            source = f'{source}+multiplier_x{multiplier}'
+            logger.info(
+                '🚀 Применён множитель реферальной комиссии',
+                user_id=getattr(user, 'id', None),
+                original_percent=original_percent,
+                multiplied_percent=percent,
+                multiplier=multiplier,
+                expires_at=str(multiplier_expires) if multiplier_expires else 'never',
+            )
+
     logger.debug(
         'Определён процент комиссии',
         user_id=getattr(user, 'id', None),

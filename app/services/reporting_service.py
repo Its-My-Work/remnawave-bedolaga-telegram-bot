@@ -306,6 +306,14 @@ class ReportingService:
             '',
         ]
 
+        # MTProxy
+        if stats.get('proxy_purchases_count', 0) > 0:
+            lines += [
+                '🛡 <b>MTProxy</b>',
+                f'• Покупок прокси: {stats["proxy_purchases_count"]} на сумму {self._format_amount(stats["proxy_purchases_amount"])}',
+                '',
+            ]
+
         # Топ по рефералам
         lines += ['🤝 <b>Топ по рефералам (за период)</b>']
         if top_referrers:
@@ -446,6 +454,22 @@ class ReportingService:
             or 0
         )
 
+        # MTProxy purchases
+        proxy_result = (
+            await session.execute(
+                select(
+                    func.count(Transaction.id),
+                    func.coalesce(func.sum(func.abs(Transaction.amount_kopeks)), 0),
+                ).where(
+                    Transaction.type == 'purchase',
+                    Transaction.is_completed == true(),
+                    Transaction.created_at >= start_utc,
+                    Transaction.created_at < end_utc,
+                    Transaction.description.ilike('%Proxy%'),
+                )
+            )
+        ).one()
+
         return {
             'new_users': new_users,
             'new_trials': new_trials,
@@ -456,6 +480,8 @@ class ReportingService:
             'deposits_count': int(deposits_count or 0),
             'deposits_amount': int(deposits_amount or 0),
             'new_tickets': new_tickets,
+            'proxy_purchases_count': int(proxy_result[0] or 0),
+            'proxy_purchases_amount': int(proxy_result[1] or 0),
         }
 
     def _txn_query_base(self, txn_type: str, start_utc: datetime, end_utc: datetime):

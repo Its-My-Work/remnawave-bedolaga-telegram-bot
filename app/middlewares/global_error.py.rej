@@ -1,0 +1,10 @@
+diff a/app/middlewares/global_error.py b/app/middlewares/global_error.py	(rejected hunks)
+@@ -24,7 +24,7 @@ ERROR_MESSAGE_MAX_LENGTH: Final[int] = 500
+ REPORT_SEPARATOR_WIDTH: Final[int] = 50
+ DATETIME_FORMAT: Final[str] = '%d.%m.%Y %H:%M:%S'
+ DATETIME_FORMAT_FILENAME: Final[str] = '%Y%m%d_%H%M%S'
+-DEVELOPER_CONTACT_URL: Final[str] = 'https://t.me/ORIGINAL_DEV'
++DEVELOPER_CONTACT_URL: Final[str] = 'https://t.me/YOUR_GROUP'
+ 
+ # Фразы ошибок Telegram API
+ OLD_QUERY_PHRASES: Final[tuple[str, ...]] = (

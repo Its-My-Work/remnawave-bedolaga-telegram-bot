@@ -380,6 +380,7 @@ async def get_wheel_statistics(
         {
             'user_id': spin.user_id,
             'username': spin.user.username if spin.user else None,
+            'first_name': spin.user.first_name if spin.user else None,
             'prize_display_name': spin.prize_display_name,
             'prize_value_kopeks': spin.prize_value_kopeks,
             'created_at': spin.created_at.isoformat() if spin.created_at else None,

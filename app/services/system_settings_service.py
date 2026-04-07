@@ -28,7 +28,19 @@ from app.services.web_api_token_service import ensure_default_web_api_token
 logger = structlog.get_logger(__name__)
 
 
+_CUSTOM_DISPLAY_NAMES: dict[str, str] = {
+    'REFERRAL_FIRST_TOPUP_INVITER_PERCENT': 'Процент пригласившему за 1-е пополнение',
+    'REFERRAL_INVITER_BONUS_KOPEKS': 'Бонус пригласившему (коп.)',
+    'REFERRAL_COMMISSION_PERCENT': 'Процент комиссии рефералов',
+    'REFERRAL_FIRST_TOPUP_BONUS_KOPEKS': 'Бонус новому за 1-е пополнение (коп.)',
+    'REFERRAL_MINIMUM_TOPUP_KOPEKS': 'Мин. пополнение для бонуса (коп.)',
+    'REFERRAL_ENABLED': 'Реферальная программа включена',
+}
+
+
 def _title_from_key(key: str) -> str:
+    if key in _CUSTOM_DISPLAY_NAMES:
+        return _CUSTOM_DISPLAY_NAMES[key]
     parts = key.split('_')
     if not parts:
         return key

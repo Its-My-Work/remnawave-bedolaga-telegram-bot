@@ -677,6 +677,15 @@ async def main():
                 version_check_task = None
                 stage.skip('Проверка версий отключена настройками')
 
+        # MTProxy expiry notifications
+        try:
+            from app.handlers.mtproxy import check_mtproxy_expiry
+            from app.database.database import AsyncSessionLocal
+            mtproxy_task = asyncio.create_task(check_mtproxy_expiry(bot, AsyncSessionLocal))
+            logger.info('MTProxy expiry checker started')
+        except Exception as e:
+            logger.warning(f'MTProxy expiry checker failed to start: {e}')
+
         async with timeline.stage(
             'Запуск polling',
             '🤖',

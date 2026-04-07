@@ -8,21 +8,14 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.config import settings
+from app.database.crud.landing import get_purchase_by_token
 from app.database.crud.system_setting import get_setting_value
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.transaction import create_transaction, emit_transaction_side_effects
 from app.database.crud.user import subtract_user_balance
-from app.database.models import (
-    GuestPurchase,
-    GuestPurchaseStatus,
-    PaymentMethod,
-    Tariff,
-    TransactionType,
-    User,
-)
+from app.database.models import GuestPurchase, GuestPurchaseStatus, PaymentMethod, Tariff, TransactionType, User
 from app.services.guest_purchase_service import (
     GuestPurchaseError,
     create_purchase,
@@ -30,12 +23,9 @@ from app.services.guest_purchase_service import (
 )
 from app.services.payment_method_config_service import get_enabled_methods_for_user
 from app.utils.cache import RateLimitCache
-from app.utils.promo_offer import get_user_active_promo_discount_percent
 
 from ..dependencies import get_cabinet_db, get_current_cabinet_user
 from ..schemas.gift import (
-    ActivateGiftRequest,
-    ActivateGiftResponse,
     GiftConfigPaymentMethod,
     GiftConfigResponse,
     GiftConfigSubOption,
@@ -45,7 +35,6 @@ from ..schemas.gift import (
     GiftPurchaseResponse,
     GiftPurchaseStatusResponse,
     PendingGiftResponse,
-    ReceivedGiftResponse,
     SentGiftResponse,
 )
 
@@ -81,63 +70,25 @@ async def get_gift_config(
             balance_kopeks=user.balance_kopeks,
         )
 
-    # Load active tariffs visible in gift section
+    # Load active tariffs
     result = await db.execute(
-        select(Tariff)
-        .where(Tariff.is_active.is_(True), Tariff.show_in_gift.is_(True))
-        .order_by(Tariff.display_order, Tariff.id)
+        select(Tariff).where(Tariff.is_active.is_(True)).order_by(Tariff.display_order, Tariff.id)
     )
     tariffs_db = result.scalars().all()
-
-    # Get user's promo group for discount calculation
-    promo_group = user.get_primary_promo_group() if hasattr(user, 'get_primary_promo_group') else None
-    if promo_group is None:
-        promo_group = getattr(user, 'promo_group', None)
-    promo_group_name = promo_group.name if promo_group else None
-
-    # Get active promo offer discount
-    promo_offer_discount_percent = get_user_active_promo_discount_percent(user)
 
     tariffs: list[GiftConfigTariff] = []
     for tariff in tariffs_db:
         period_days_list = tariff.get_available_periods()
         periods: list[GiftConfigTariffPeriod] = []
         for days in period_days_list:
-            base_price = tariff.get_price_for_period(days)
-            if base_price is None:
+            price = tariff.get_price_for_period(days)
+            if price is None:
                 continue
-
-            original_price = base_price
-            price = base_price
-
-            # Apply promo group discount
-            from app.services.pricing_engine import PricingEngine
-
-            promo_group_discount = 0
-            if promo_group:
-                promo_group_discount = promo_group.get_discount_percent('period', days)
-                if promo_group_discount > 0:
-                    price = PricingEngine.apply_discount(price, promo_group_discount)
-
-            # Apply active promo offer discount (stacks on top)
-            if promo_offer_discount_percent > 0:
-                price = PricingEngine.apply_discount(price, promo_offer_discount_percent)
-
-            # Ensure minimum price of 1 kopek after all discounts
-            price = max(1, price)
-
-            # Calculate combined discount percent
-            combined_discount = 0
-            if original_price > 0 and original_price != price:
-                combined_discount = int((original_price - price) * 100 / original_price)
-
             periods.append(
                 GiftConfigTariffPeriod(
                     days=days,
                     price_kopeks=price,
                     price_label=settings.format_price(price),
-                    original_price_kopeks=original_price if combined_discount > 0 else None,
-                    discount_percent=combined_discount if combined_discount > 0 else None,
                 )
             )
         if not periods:
@@ -177,11 +128,7 @@ async def get_gift_config(
         payment_methods=payment_methods,
         balance_kopeks=user.balance_kopeks,
         currency_symbol=getattr(settings, 'CURRENCY_SYMBOL', '\u20bd'),
-        promo_group_name=promo_group_name,
-        active_discount_percent=promo_offer_discount_percent if promo_offer_discount_percent > 0 else None,
-        active_discount_expires_at=(
-            getattr(user, 'promo_offer_discount_expires_at', None) if promo_offer_discount_percent > 0 else None
-        ),
+        bot_username=settings.get_bot_username() or '',
     )
 
 
@@ -211,67 +158,51 @@ async def create_gift_purchase(
             detail='Purchases are restricted for this account',
         )
 
-    # Recipient is optional — when omitted, buyer gets a code to share manually
-    has_recipient = bool(body.recipient_type and body.recipient_value)
+    # === LINK MODE: no recipient needed ===
+    if body.recipient_type == 'link':
+        return await _handle_link_gift_purchase(db, user, body)
 
-    if has_recipient:
-        # Validate recipient format
-        if body.recipient_type == 'email' and not _EMAIL_RE.match(body.recipient_value):
+    # Validate recipient format
+    if body.recipient_type == 'email' and not _EMAIL_RE.match(body.recipient_value):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Invalid email format',
+        )
+    if body.recipient_type == 'telegram' and not _TELEGRAM_RE.match(body.recipient_value):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Invalid Telegram username format',
+        )
+
+    # Prevent self-gift
+    if body.recipient_type == 'telegram':
+        normalized_recipient = body.recipient_value.lstrip('@').lower()
+        if user.username and user.username.lower() == normalized_recipient:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Invalid email format',
+                detail='Cannot gift to yourself',
             )
-        if body.recipient_type == 'telegram' and not _TELEGRAM_RE.match(body.recipient_value):
+    elif body.recipient_type == 'email':
+        if user.email and user.email.lower() == body.recipient_value.lower():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Invalid Telegram username format',
+                detail='Cannot gift to yourself',
             )
-
-        # Prevent self-gift
-        if body.recipient_type == 'telegram':
-            normalized_recipient = body.recipient_value.lstrip('@').lower()
-            if user.username and user.username.lower() == normalized_recipient:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail='Cannot gift to yourself',
-                )
-        elif body.recipient_type == 'email':
-            if user.email and user.email.lower() == body.recipient_value.lower():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail='Cannot gift to yourself',
-                )
 
     # Find tariff and validate period
     tariff = await get_tariff_by_id(db, body.tariff_id)
-    if tariff is None or not tariff.is_active or not tariff.show_in_gift:
+    if tariff is None or not tariff.is_active:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Tariff not found or inactive',
         )
 
-    # Validate that period has a configured price before locking
-    if tariff.get_price_for_period(body.period_days) is None:
+    price_kopeks = tariff.get_price_for_period(body.period_days)
+    if price_kopeks is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Price is not configured for this period',
         )
-
-    # Lock user BEFORE price computation to prevent TOCTOU on promo offer
-    from app.database.crud.user import lock_user_for_pricing
-
-    user = await lock_user_for_pricing(db, user.id)
-
-    from app.services.pricing_engine import pricing_engine
-
-    pricing_result = await pricing_engine.calculate_tariff_purchase_price(
-        tariff,
-        body.period_days,
-        device_limit=tariff.device_limit,
-        user=user,
-    )
-    price_kopeks = max(1, pricing_result.final_total)
-    consume_promo = pricing_result.promo_offer_discount > 0
 
     # Determine buyer contact info
     if user.email:
@@ -285,10 +216,11 @@ async def create_gift_purchase(
         buyer_contact_value = f'id:{user.telegram_id or user.id}'
 
     # Pre-check: try to resolve Telegram username — DB first, then Bot API.
-    # Only relevant when a recipient is explicitly specified.
+    # Placed after validation gates to prevent zero-cost enumeration.
+    # The resolved ID is passed to fulfill_purchase to avoid a duplicate API call.
     recipient_warning: str | None = None
     pre_resolved_telegram_id: int | None = None
-    if has_recipient and body.recipient_type == 'telegram':
+    if body.recipient_type == 'telegram':
         tg_username = body.recipient_value.lstrip('@')
         normalized_username = tg_username.lower()
 
@@ -306,17 +238,16 @@ async def create_gift_purchase(
         else:
             # 2) Fall back to Bot API (works for public usernames the bot has seen)
             try:
-                from app.bot_factory import create_bot
+                from aiogram import Bot
 
-                async with create_bot() as bot:
+                async with Bot(token=settings.BOT_TOKEN) as bot:
                     chat = await asyncio.wait_for(bot.get_chat(chat_id=f'@{tg_username}'), timeout=5.0)
                     pre_resolved_telegram_id = chat.id
             except Exception:
-                recipient_warning = 'telegram_unresolvable'
-                logger.warning(
-                    'Telegram username not resolvable for gift',
-                    username=tg_username,
-                    buyer_id=user.id,
+                # Block purchase if telegram recipient cannot be found
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail='recipient_not_found',
                 )
 
     # Gateway mode: create payment via external provider
@@ -326,18 +257,6 @@ async def create_gift_purchase(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='payment_method is required for gateway mode',
             )
-
-        purchase_kwargs: dict = (
-            {
-                'gift_recipient_type': body.recipient_type,
-                'gift_recipient_value': body.recipient_value,
-                'gift_message': body.gift_message,
-            }
-            if has_recipient
-            else {
-                'gift_message': body.gift_message,
-            }
-        )
 
         try:
             purchase = await create_purchase(
@@ -350,10 +269,12 @@ async def create_gift_purchase(
                 contact_value=buyer_contact_value,
                 payment_method=body.payment_method,
                 is_gift=True,
+                gift_recipient_type=body.recipient_type,
+                gift_recipient_value=body.recipient_value,
+                gift_message=body.gift_message,
                 source='cabinet',
                 buyer_user_id=user.id,
                 commit=False,
-                **purchase_kwargs,
             )
         except GuestPurchaseError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
@@ -364,30 +285,19 @@ async def create_gift_purchase(
 
         # Build return URL for after payment
         cabinet_base = (settings.CABINET_URL or '').rstrip('/')
-        return_url = f'{cabinet_base}/gift/result?token={purchase.token[:12]}'
+        return_url = f'{cabinet_base}/gift/result?token={purchase.token}'
 
         from app.services.payment_service import PaymentService
 
-        # Stars payments need a Bot instance to create invoice links
-        bot = None
-        if body.payment_method == 'telegram_stars':
-            from app.bot_factory import create_bot
-
-            bot = create_bot()
-
-        try:
-            payment_service = PaymentService(bot=bot)
-            payment_result = await payment_service.create_guest_payment(
-                db=db,
-                amount_kopeks=price_kopeks,
-                payment_method=body.payment_method,
-                description=f'Gift: {tariff.name} ({body.period_days}d)',
-                purchase_token=purchase.token,
-                return_url=return_url,
-            )
-        finally:
-            if bot:
-                await bot.session.close()
+        payment_service = PaymentService()
+        payment_result = await payment_service.create_guest_payment(
+            db=db,
+            amount_kopeks=price_kopeks,
+            payment_method=body.payment_method,
+            description=f'Gift: {tariff.name} ({body.period_days}d)',
+            purchase_token=purchase.token,
+            return_url=return_url,
+        )
 
         if payment_result is None:
             await db.rollback()
@@ -409,18 +319,12 @@ async def create_gift_purchase(
                 detail='Payment provider returned an invalid response',
             )
 
-        # Consume promo offer discount before committing gateway purchase
-        if consume_promo and getattr(user, 'promo_offer_discount_percent', 0):
-            user.promo_offer_discount_percent = 0
-            user.promo_offer_discount_source = None
-            user.promo_offer_discount_expires_at = None
-
         await db.commit()
         await db.refresh(purchase)
 
         return GiftPurchaseResponse(
             status='created',
-            purchase_token=purchase.token[:12],
+            purchase_token=purchase.token,
             payment_url=payment_url,
             warning=recipient_warning,
         )
@@ -433,18 +337,6 @@ async def create_gift_purchase(
         )
 
     # Create purchase record
-    balance_purchase_kwargs: dict = (
-        {
-            'gift_recipient_type': body.recipient_type,
-            'gift_recipient_value': body.recipient_value,
-            'gift_message': body.gift_message,
-        }
-        if has_recipient
-        else {
-            'gift_message': body.gift_message,
-        }
-    )
-
     try:
         purchase = await create_purchase(
             db,
@@ -456,10 +348,12 @@ async def create_gift_purchase(
             contact_value=buyer_contact_value,
             payment_method='balance',
             is_gift=True,
+            gift_recipient_type=body.recipient_type,
+            gift_recipient_value=body.recipient_value,
+            gift_message=body.gift_message,
             source='cabinet',
             buyer_user_id=user.id,
             commit=False,
-            **balance_purchase_kwargs,
         )
     except GuestPurchaseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
@@ -468,14 +362,13 @@ async def create_gift_purchase(
     if recipient_warning:
         purchase.recipient_warning = recipient_warning
 
-    # Subtract balance (consume promo offer if one was applied)
+    # Subtract balance
     balance_ok = await subtract_user_balance(
         db,
         user,
         price_kopeks,
         description=f'Gift: {tariff.name} ({body.period_days}d)',
         create_transaction=False,
-        consume_promo_offer=consume_promo,
     )
     if not balance_ok:
         await db.rollback()
@@ -484,18 +377,13 @@ async def create_gift_purchase(
             detail='Insufficient balance',
         )
 
-    # Transaction description: include recipient when specified
-    tx_description = f'Gift: {tariff.name} ({body.period_days}d)'
-    if has_recipient:
-        tx_description += f' -> {body.recipient_value}'
-
     # Create transaction record
     transaction = await create_transaction(
         db,
         user_id=user.id,
         type=TransactionType.GIFT_PAYMENT,
         amount_kopeks=price_kopeks,
-        description=tx_description,
+        description=f'Gift: {tariff.name} ({body.period_days}d) -> {body.recipient_value}',
         payment_method=PaymentMethod.BALANCE,
         commit=False,
     )
@@ -514,27 +402,225 @@ async def create_gift_purchase(
         user_id=user.id,
         type=TransactionType.GIFT_PAYMENT,
         payment_method=PaymentMethod.BALANCE,
-        description=tx_description,
+        description=f'Gift: {tariff.name} ({body.period_days}d) -> {body.recipient_value}',
     )
 
     # Capture token before fulfill_purchase — session state may change after rollback inside fulfill
     purchase_token = purchase.token
 
-    # Only fulfill immediately when a specific recipient was provided.
-    # Code-only gifts (no recipient) stay in PAID status until someone activates via code.
-    if has_recipient:
-        try:
-            await fulfill_purchase(db, purchase_token, pre_resolved_telegram_id=pre_resolved_telegram_id)
-        except Exception:
-            logger.exception(
-                'Gift purchase fulfillment failed (purchase is paid, will retry)',
-                purchase_id=purchase.id,
-            )
+    # Fulfill the purchase (find/create recipient user, create subscription, notify)
+    try:
+        await fulfill_purchase(db, purchase_token, pre_resolved_telegram_id=pre_resolved_telegram_id)
+    except Exception:
+        logger.exception(
+            'Gift purchase fulfillment failed (purchase is paid, will retry)',
+            purchase_id=purchase.id,
+        )
 
     return GiftPurchaseResponse(
         status='ok',
-        purchase_token=purchase_token[:12],
+        purchase_token=purchase_token,
         warning=recipient_warning,
+    )
+
+
+def _build_gift_link(purchase_token: str) -> str | None:
+    """Build a t.me deep link for gift activation."""
+    bot_username = settings.get_bot_username()
+    if not bot_username:
+        return None
+    return f'https://t.me/{bot_username}?start=gift_{purchase_token}'
+
+
+async def _handle_link_gift_purchase(
+    db: AsyncSession,
+    user: User,
+    body: GiftPurchaseRequest,
+) -> GiftPurchaseResponse:
+    """Handle gift purchase in link mode (no recipient - generates activation link)."""
+    from app.database.crud.transaction import create_transaction, emit_transaction_side_effects
+
+    # Find tariff and validate period
+    tariff = await get_tariff_by_id(db, body.tariff_id)
+    if tariff is None or not tariff.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Tariff not found or inactive',
+        )
+
+    price_kopeks = tariff.get_price_for_period(body.period_days)
+    if price_kopeks is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Price is not configured for this period',
+        )
+
+    # Determine buyer contact info
+    if user.email:
+        buyer_contact_type = 'email'
+        buyer_contact_value = user.email
+    elif user.username:
+        buyer_contact_type = 'telegram'
+        buyer_contact_value = f'@{user.username}'
+    else:
+        buyer_contact_type = 'telegram'
+        buyer_contact_value = f'id:{user.telegram_id or user.id}'
+
+    if body.payment_mode == 'gateway':
+        if not body.payment_method:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='payment_method is required for gateway mode',
+            )
+
+        try:
+            purchase = await create_purchase(
+                db,
+                landing=None,
+                tariff=tariff,
+                period_days=body.period_days,
+                amount_kopeks=price_kopeks,
+                contact_type=buyer_contact_type,
+                contact_value=buyer_contact_value,
+                payment_method=body.payment_method,
+                is_gift=True,
+                gift_recipient_type='link',
+                gift_recipient_value='pending',
+                gift_message=body.gift_message,
+                source='cabinet',
+                buyer_user_id=user.id,
+                commit=False,
+            )
+        except GuestPurchaseError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+        cabinet_base = (settings.CABINET_URL or '').rstrip('/')
+        return_url = f'{cabinet_base}/gift/result?token={purchase.token}'
+
+        from app.services.payment_service import PaymentService
+
+        payment_service = PaymentService()
+        payment_result = await payment_service.create_guest_payment(
+            db=db,
+            amount_kopeks=price_kopeks,
+            payment_method=body.payment_method,
+            description=f'Gift link: {tariff.name} ({body.period_days}d)',
+            purchase_token=purchase.token,
+            return_url=return_url,
+        )
+
+        if payment_result is None:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Payment provider is unavailable, please try again later',
+            )
+
+        payment_url = payment_result.get('payment_url')
+        if not payment_url:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail='Payment provider returned an invalid response',
+            )
+
+        await db.commit()
+        await db.refresh(purchase)
+
+        return GiftPurchaseResponse(
+            status='created',
+            purchase_token=purchase.token,
+            payment_url=payment_url,
+            gift_link=_build_gift_link(purchase.token),
+        )
+
+    # === Balance mode ===
+    if user.balance_kopeks < price_kopeks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Insufficient balance',
+        )
+
+    try:
+        purchase = await create_purchase(
+            db,
+            landing=None,
+            tariff=tariff,
+            period_days=body.period_days,
+            amount_kopeks=price_kopeks,
+            contact_type=buyer_contact_type,
+            contact_value=buyer_contact_value,
+            payment_method='balance',
+            is_gift=True,
+            gift_recipient_type='link',
+            gift_recipient_value='pending',
+            gift_message=body.gift_message,
+            source='cabinet',
+            buyer_user_id=user.id,
+            commit=False,
+        )
+    except GuestPurchaseError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+    # Subtract balance
+    balance_ok = await subtract_user_balance(
+        db,
+        user,
+        price_kopeks,
+        description=f'Gift link: {tariff.name} ({body.period_days}d)',
+        create_transaction=False,
+    )
+    if not balance_ok:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Insufficient balance',
+        )
+
+    # Create transaction
+    transaction = await create_transaction(
+        db,
+        user_id=user.id,
+        type=TransactionType.GIFT_PAYMENT,
+        amount_kopeks=price_kopeks,
+        description=f'Gift link: {tariff.name} ({body.period_days}d)',
+        payment_method=PaymentMethod.BALANCE,
+        commit=False,
+    )
+
+    # Mark as paid
+    purchase.status = GuestPurchaseStatus.PAID.value
+    purchase.paid_at = datetime.now(UTC)
+
+    await db.commit()
+
+    # Emit side-effects
+    await emit_transaction_side_effects(
+        db,
+        transaction,
+        amount_kopeks=price_kopeks,
+        user_id=user.id,
+        type=TransactionType.GIFT_PAYMENT,
+        payment_method=PaymentMethod.BALANCE,
+        description=f'Gift link: {tariff.name} ({body.period_days}d)',
+    )
+
+    # Fulfill purchase - for link mode this will set PENDING_ACTIVATION
+    purchase_token = purchase.token
+    try:
+        await fulfill_purchase(db, purchase_token)
+    except Exception:
+        logger.exception(
+            'Gift link purchase fulfillment failed (purchase is paid, will retry)',
+            purchase_token=purchase_token[:5],
+        )
+
+    gift_link = _build_gift_link(purchase_token)
+
+    return GiftPurchaseResponse(
+        status='ok',
+        purchase_token=purchase_token,
+        gift_link=gift_link,
     )
 
 
@@ -546,14 +632,12 @@ async def get_pending_gifts(
     """Get pending gift purchases that the current user can activate."""
     result = await db.execute(
         select(GuestPurchase)
-        .options(selectinload(GuestPurchase.tariff))
         .where(
             GuestPurchase.user_id == user.id,
             GuestPurchase.is_gift.is_(True),
             GuestPurchase.status == GuestPurchaseStatus.PENDING_ACTIVATION.value,
         )
         .order_by(GuestPurchase.created_at.desc())
-        .limit(100)
     )
     purchases = result.scalars().all()
 
@@ -566,7 +650,7 @@ async def get_pending_gifts(
 
         pending.append(
             PendingGiftResponse(
-                token=p.token[:12],
+                token=p.token,
                 tariff_name=p.tariff.name if p.tariff else None,
                 period_days=p.period_days,
                 gift_message=p.gift_message,
@@ -585,13 +669,7 @@ async def get_gift_purchase_status(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Get the status of a cabinet gift purchase."""
-    if len(token) >= 64:
-        token_filter = GuestPurchase.token == token
-    else:
-        token_filter = GuestPurchase.token.startswith(token)
-
-    result = await db.execute(select(GuestPurchase).options(selectinload(GuestPurchase.tariff)).where(token_filter))
-    purchase = result.scalars().first()
+    purchase = await get_purchase_by_token(db, token)
     if purchase is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -611,17 +689,19 @@ async def get_gift_purchase_status(
     if purchase.gift_recipient_value:
         recipient_contact_value = purchase.gift_recipient_value
 
-    is_code_only = purchase.is_gift and not purchase.gift_recipient_type
+    # Generate gift_link for link-mode gifts
+    gift_link = None
+    if purchase.gift_recipient_type == 'link':
+        gift_link = _build_gift_link(purchase.token)
 
     return GiftPurchaseStatusResponse(
         status=purchase.status,
         is_gift=True,
-        is_code_only=is_code_only,
-        purchase_token=purchase.token[:12] if is_code_only else None,
         recipient_contact_value=recipient_contact_value,
         gift_message=purchase.gift_message,
         tariff_name=tariff_name,
         period_days=purchase.period_days,
+        gift_link=gift_link,
         warning=purchase.recipient_warning,
     )
 
@@ -631,176 +711,56 @@ async def get_sent_gifts(
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
 ):
-    """Get all gifts the current user has sent."""
+    """Get gifts sent by the current user."""
     result = await db.execute(
         select(GuestPurchase)
-        .options(selectinload(GuestPurchase.tariff), selectinload(GuestPurchase.user))
         .where(
             GuestPurchase.buyer_user_id == user.id,
             GuestPurchase.is_gift.is_(True),
+            GuestPurchase.status.in_([
+                GuestPurchaseStatus.PENDING_ACTIVATION.value,
+                GuestPurchaseStatus.DELIVERED.value,
+                GuestPurchaseStatus.PAID.value,
+            ]),
         )
         .order_by(GuestPurchase.created_at.desc())
-        .limit(100)
+        .limit(50)
     )
     purchases = result.scalars().all()
 
-    sent: list[SentGiftResponse] = []
+    gifts: list[SentGiftResponse] = []
     for p in purchases:
-        activated_by_username = None
-        if p.status == GuestPurchaseStatus.DELIVERED.value and p.user and p.user.username:
-            activated_by_username = f'@{p.user.username}'
+        tariff_name = p.tariff.name if p.tariff else None
 
-        sent.append(
+        # Build gift_link for link-mode pending gifts
+        gift_link = None
+        if p.gift_recipient_type == 'link' and p.status in (
+            GuestPurchaseStatus.PENDING_ACTIVATION.value,
+            GuestPurchaseStatus.PAID.value,
+        ):
+            gift_link = _build_gift_link(p.token)
+
+        # Get activated-by username for delivered gifts
+        activated_by_username = None
+        if p.status == GuestPurchaseStatus.DELIVERED.value and p.user_id and p.user:
+            activated_by_username = p.user.username
+            if not activated_by_username and p.user.telegram_id:
+                activated_by_username = f'id:{p.user.telegram_id}'
+
+        gifts.append(
             SentGiftResponse(
-                token=p.token[:12],
-                tariff_name=p.tariff.name if p.tariff else None,
-                period_days=p.period_days,
-                device_limit=p.tariff.device_limit if p.tariff else 1,
+                token=p.token,
                 status=p.status,
-                gift_recipient_value=p.gift_recipient_value,
+                tariff_name=tariff_name,
+                period_days=p.period_days,
+                gift_recipient_type=p.gift_recipient_type,
+                gift_recipient_value=p.gift_recipient_value if p.gift_recipient_value != 'pending' else None,
                 gift_message=p.gift_message,
+                gift_link=gift_link,
                 activated_by_username=activated_by_username,
                 created_at=p.created_at,
+                delivered_at=p.delivered_at,
             )
         )
 
-    return sent
-
-
-@router.get('/received', response_model=list[ReceivedGiftResponse])
-async def get_received_gifts(
-    user: User = Depends(get_current_cabinet_user),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Get all gifts the current user has received."""
-    result = await db.execute(
-        select(GuestPurchase)
-        .options(selectinload(GuestPurchase.tariff), selectinload(GuestPurchase.buyer))
-        .where(
-            GuestPurchase.user_id == user.id,
-            GuestPurchase.is_gift.is_(True),
-        )
-        .order_by(GuestPurchase.created_at.desc())
-        .limit(100)
-    )
-    purchases = result.scalars().all()
-
-    received: list[ReceivedGiftResponse] = []
-    for p in purchases:
-        sender_display = None
-        if p.buyer and p.buyer.username:
-            sender_display = f'@{p.buyer.username}'
-        elif p.contact_value:
-            sender_display = p.contact_value
-
-        received.append(
-            ReceivedGiftResponse(
-                token=p.token[:12],
-                tariff_name=p.tariff.name if p.tariff else None,
-                period_days=p.period_days,
-                device_limit=p.tariff.device_limit if p.tariff else 1,
-                status=p.status,
-                sender_display=sender_display,
-                gift_message=p.gift_message,
-                created_at=p.created_at,
-            )
-        )
-
-    return received
-
-
-@router.post('/activate', response_model=ActivateGiftResponse)
-async def activate_gift_by_code(
-    body: ActivateGiftRequest,
-    user: User = Depends(get_current_cabinet_user),
-    db: AsyncSession = Depends(get_cabinet_db),
-):
-    """Activate a gift subscription by its code (token)."""
-    from app.services.guest_purchase_service import activate_purchase as svc_activate
-
-    # Bug 2 fix: rate limit activation attempts to prevent brute-force token enumeration
-    is_limited = await RateLimitCache.is_rate_limited(user.id, 'gift_activate', limit=10, window=60)
-    if is_limited:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Too many requests')
-
-    code = body.code.strip()
-    if code.upper().startswith('GIFT-') or code.upper().startswith('GIFT_'):
-        code = code[5:]
-
-    if len(code) < 8:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Code too short')
-
-    # Support both full token and prefix-based lookup (displayed codes are truncated)
-    if len(code) >= 64:
-        # Full token — exact match
-        token_filter = GuestPurchase.token == code
-    else:
-        # Prefix match — for short display codes like GIFT-XXXXXXXXXXXX
-        token_filter = GuestPurchase.token.startswith(code)
-
-    result = await db.execute(
-        select(GuestPurchase)
-        .options(selectinload(GuestPurchase.tariff))
-        .where(token_filter, GuestPurchase.is_gift.is_(True))
-        .with_for_update()
-    )
-    purchase = result.scalars().first()
-
-    if purchase is None or not purchase.is_gift:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail='Gift not found',
-        )
-
-    # Bug 1 fix: check ownership BEFORE leaking any status/tariff info
-    if purchase.user_id is not None and purchase.user_id != user.id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail='Gift not found',
-        )
-
-    # Prevent self-activation: buyer cannot activate their own gift
-    if purchase.buyer_user_id is not None and purchase.buyer_user_id == user.id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='Cannot activate your own gift',
-        )
-
-    if purchase.status == GuestPurchaseStatus.DELIVERED.value:
-        return ActivateGiftResponse(
-            status='activated',
-            tariff_name=purchase.tariff.name if purchase.tariff else None,
-            period_days=purchase.period_days,
-        )
-
-    # Code-only gifts are in PAID status; directed gifts are in PENDING_ACTIVATION
-    activatable_statuses = {
-        GuestPurchaseStatus.PENDING_ACTIVATION.value,
-        GuestPurchaseStatus.PAID.value,
-    }
-    if purchase.status not in activatable_statuses:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='This gift cannot be activated',
-        )
-
-    # For code-only gifts (user_id is None), link the purchase to the activating user
-    if purchase.user_id is None:
-        purchase.user_id = user.id
-
-    # Transition PAID → PENDING_ACTIVATION so activate_purchase() accepts it
-    if purchase.status == GuestPurchaseStatus.PAID.value:
-        purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
-
-    await db.flush()
-
-    try:
-        await svc_activate(db, purchase.token, skip_notification=True)
-    except GuestPurchaseError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
-
-    return ActivateGiftResponse(
-        status='activated',
-        tariff_name=purchase.tariff.name if purchase.tariff else None,
-        period_days=purchase.period_days,
-    )
+    return gifts

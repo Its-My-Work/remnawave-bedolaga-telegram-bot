@@ -34,17 +34,20 @@ class PlategaPaymentMixin:
         payment_method_code: int,
         return_url: str | None = None,
         failed_url: str | None = None,
+        min_amount_override: int | None = None,
+        metadata_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         service: PlategaService | None = getattr(self, 'platega_service', None)
         if not service or not service.is_configured:
             logger.error('Platega сервис не инициализирован')
             return None
 
-        if amount_kopeks < settings.PLATEGA_MIN_AMOUNT_KOPEKS:
+        effective_min = min_amount_override if min_amount_override is not None else settings.PLATEGA_MIN_AMOUNT_KOPEKS
+        if amount_kopeks < effective_min:
             logger.warning(
                 'Сумма Platega меньше минимальной: <',
                 amount_kopeks=amount_kopeks,
-                PLATEGA_MIN_AMOUNT_KOPEKS=settings.PLATEGA_MIN_AMOUNT_KOPEKS,
+                effective_min=effective_min,
             )
             return None
 
@@ -92,6 +95,8 @@ class PlategaPaymentMixin:
             'language': language,
             'selected_method': payment_method_code,
         }
+        if metadata_extra:
+            metadata.update(metadata_extra)
 
         payment_module = import_module('app.services.payment_service')
 
@@ -321,6 +326,139 @@ class PlategaPaymentMixin:
             provider_name='platega',
         )
         if guest_result is not None:
+            return payment
+
+        # --- Прямая покупка MTProxy (без зачисления на баланс) ---
+        if metadata.get('for_product') == 'mtproxy':
+            proxy_quantity = int(metadata.get('proxy_quantity', 1))
+
+            if payload is not None:
+                metadata['webhook'] = payload
+
+            # Создаём транзакцию как DEPOSIT (отображается в финансах)
+            payment.status = 'CONFIRMED'
+            payment.is_paid = True
+            payment.metadata_json = metadata
+            if payload is not None:
+                payment.callback_payload = payload
+            payment.updated_at = datetime.now(UTC)
+
+            payment_module = import_module('app.services.payment_service')
+            user = await payment_module.get_user_by_id(db, payment.user_id)
+            if not user:
+                logger.error('Пользователь не найден для MTProxy покупки', user_id=payment.user_id)
+                return payment
+
+            transaction_external_id = (
+                str(payload.get('id'))
+                if isinstance(payload, dict) and payload.get('id')
+                else payment.platega_transaction_id
+            )
+            platega_name = settings.get_platega_display_name()
+            method_display = settings.get_platega_method_display_name(payment.payment_method_code)
+            description = f'Покупка {proxy_quantity}x MTProxy через {platega_name}'
+            if method_display:
+                description += f' ({method_display})'
+
+            transaction = await payment_module.create_transaction(
+                db,
+                user_id=payment.user_id,
+                type=TransactionType.DEPOSIT,
+                amount_kopeks=payment.amount_kopeks,
+                description=description,
+                payment_method=PaymentMethod.PLATEGA,
+                external_id=transaction_external_id or payment.correlation_id,
+                is_completed=True,
+                created_at=getattr(payment, 'created_at', None),
+                commit=False,
+            )
+            await payment_module.link_platega_payment_to_transaction(db, payment=payment, transaction_id=transaction.id)
+            await db.commit()
+
+            # Создаём прокси
+            created_proxies = []
+            try:
+                from app.handlers.mtproxy import _api_call, _get_mtproxy_settings
+                cfg = await _get_mtproxy_settings(db)
+                for i in range(proxy_quantity):
+                    result = await _api_call('POST', '/proxy/create', cfg, {
+                        'user_id': user.telegram_id,
+                        'username': user.username or user.first_name or str(user.telegram_id),
+                        'days': 30,
+                    })
+                    if result and 'link' in result:
+                        created_proxies.append(result)
+            except Exception as e:
+                logger.error('Ошибка создания прокси после оплаты Platega', error=str(e))
+
+            bot = getattr(self, 'bot', None)
+
+            if created_proxies and bot:
+                # Уведомляем пользователя
+                try:
+                    from aiogram import types
+                    text = f'\u2705 <b>Оплата прошла! Создано прокси: {len(created_proxies)}</b>\n\n'
+                    text += '\U0001f4f1 <b>Мгновенное подключение:</b>\n'
+                    text += 'Нажмите «\U0001f517 Подключить» — прокси добавится автоматически!\n\n'
+                    buttons = []
+                    for idx, p in enumerate(created_proxies, 1):
+                        exp = p.get('expires_at', '')[:10]
+                        text += f'\U0001f511 <b>#{idx}</b> до {exp}\n<code>{p["link"]}</code>\n\n'
+                        buttons.append([types.InlineKeyboardButton(text=f'\U0001f517 Подключить #{idx}', url=p['link'])])
+                    text += '\u26a0\ufe0f 1 прокси = 1 устройство.\n\U0001f4a1 Только для Telegram!'
+                    buttons.append([types.InlineKeyboardButton(text='\U0001f4cb Мои прокси', callback_data='mtproxy_my_list')])
+                    await bot.send_message(
+                        user.telegram_id, text, parse_mode='HTML',
+                        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons),
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.error('Ошибка уведомления пользователя о покупке MTProxy', error=str(e))
+
+                # Уведомляем админов
+                try:
+                    from app.services.admin_notification_service import AdminNotificationService
+                    notif = AdminNotificationService(bot)
+                    await notif.send_mtproxy_purchase_notification(
+                        user=user, qty=len(created_proxies),
+                        total_kopeks=payment.amount_kopeks,
+                    )
+                except Exception as e:
+                    logger.error('Ошибка админ-уведомления о покупке MTProxy', error=str(e))
+
+            elif not created_proxies:
+                # Не удалось создать прокси — зачисляем на баланс как fallback
+                logger.error('Не удалось создать прокси, зачисляем на баланс', user_id=user.id)
+                from app.database.crud.user import lock_user_for_update
+                user = await lock_user_for_update(db, user)
+                user.balance_kopeks += payment.amount_kopeks
+                user.updated_at = datetime.now(UTC)
+                await db.commit()
+                if bot:
+                    try:
+                        fallback_text = (
+                            '\u26a0\ufe0f <b>Оплата прошла, но не удалось создать прокси.</b>\n\n'
+                            f'\U0001f4b0 Сумма {settings.format_price(payment.amount_kopeks)} зачислена на баланс.\n'
+                            'Вы можете купить прокси через меню.'
+                        )
+                        await bot.send_message(
+                            user.telegram_id,
+                            fallback_text,
+                            parse_mode='HTML',
+                        )
+                    except Exception:
+                        pass
+
+            metadata['mtproxy_created'] = len(created_proxies)
+            metadata['balance_credited'] = False
+            await payment_module.update_platega_payment(db, payment=payment, metadata=metadata)
+
+            logger.info(
+                'Обработана покупка MTProxy через Platega',
+                correlation_id=payment.correlation_id,
+                user_id=payment.user_id,
+                proxy_created=len(created_proxies),
+            )
             return payment
 
         if payload is not None:

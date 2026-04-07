@@ -11,6 +11,9 @@ from typing import Any
 import structlog
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from app.utils.button_styles_cache import CALLBACK_TO_SECTION, get_cached_button_styles
+from app.utils.miniapp_buttons import _resolve_style
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +36,51 @@ from .stats_service import MenuLayoutStatsService
 
 logger = structlog.get_logger(__name__)
 
+
+
+# Mapping from menu_layout button_id / action to button style section.
+_BUTTON_ID_TO_SECTION: dict[str, str] = {
+    'balance': 'balance',
+    'cabinet': 'home',
+    'subscription': 'subscription',
+    'buy_subscription': 'subscription',
+    'simple_subscription': 'subscription',
+    'buy_traffic': 'subscription',
+    'trial': 'subscription',
+    'resume_checkout': 'subscription',
+    'connect': 'subscription',
+    'happ_download': 'subscription',
+    'referrals': 'referral',
+    'referral': 'referral',
+    'promocode': 'balance',
+    'support': 'support',
+    'info': 'info',
+    'admin_panel': 'admin',
+    'moderator_panel': 'admin',
+    'language': 'info',
+    'contests': 'info',
+}
+
+_ACTION_TO_SECTION: dict[str, str] = {
+    'menu_balance': 'balance',
+    'menu_subscription': 'subscription',
+    'menu_buy': 'subscription',
+    'menu_referrals': 'referral',
+    'menu_referral': 'referral',
+    'menu_promocode': 'balance',
+    'menu_support': 'support',
+    'menu_info': 'info',
+    'menu_trial': 'subscription',
+    'admin_panel': 'admin',
+    'moderator_panel': 'admin',
+    'menu_language': 'info',
+    'subscription_connect': 'subscription',
+    'simple_subscription_purchase': 'subscription',
+    'return_to_saved_cart': 'subscription',
+    'buy_traffic': 'subscription',
+    'subscription_happ_download': 'subscription',
+    'contests_menu': 'info',
+}
 
 class MenuLayoutService:
     """Сервис для управления конфигурацией меню."""
@@ -1034,18 +1082,25 @@ class MenuLayoutService:
         if icon and not text.startswith(icon):
             text = f'{icon} {text}'
 
+        # Resolve button style from cache, then from button_config
+        _section = _BUTTON_ID_TO_SECTION.get(effective_button_id) or _ACTION_TO_SECTION.get(action)
+        _cached = get_cached_button_styles()
+        _section_cfg = _cached.get(_section or '', {}) if _section else {}
+        _btn_style = _resolve_style(_section_cfg.get('style')) or _resolve_style(button_config.get('style'))
+        _btn_emoji = _section_cfg.get('icon_custom_emoji_id') or button_config.get('icon_custom_emoji_id') or None
+
         # Форматируем динамический текст
         if button_config.get('dynamic_text'):
             text = cls._format_dynamic_text(text, context, texts)
 
         # Строим кнопку в зависимости от типа
         if button_type == 'url':
-            return InlineKeyboardButton(text=text, url=action)
+            return InlineKeyboardButton(text=text, url=action, style=_btn_style, icon_custom_emoji_id=_btn_emoji)
         if button_type == 'mini_app':
-            return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=action))
+            return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=action), style=_btn_style, icon_custom_emoji_id=_btn_emoji)
         if button_type == 'callback':
             # Кастомная кнопка с callback_data
-            return InlineKeyboardButton(text=text, callback_data=action)
+            return InlineKeyboardButton(text=text, callback_data=action, style=_btn_style, icon_custom_emoji_id=_btn_emoji)
         # builtin - проверяем open_mode
         if open_mode == 'direct':
             # Прямое открытие Mini App через WebAppInfo
@@ -1071,7 +1126,7 @@ class MenuLayoutService:
             # Проверяем, что это действительно URL
             if url and (url.startswith('http://') or url.startswith('https://')):
                 logger.info('🔗 Кнопка connect: open_mode=direct, используем URL: ...', url=url[:50])
-                return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=url))
+                return InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=url), style=_btn_style, icon_custom_emoji_id=_btn_emoji)
             logger.warning(
                 '🔗 Кнопка connect: open_mode=direct, но URL не найден. webapp_url=, action=, subscription_url',
                 webapp_url=webapp_url,
@@ -1079,10 +1134,10 @@ class MenuLayoutService:
                 value='есть' if context.subscription else 'нет',
             )
             # Fallback на callback_data
-            return InlineKeyboardButton(text=text, callback_data=action)
+            return InlineKeyboardButton(text=text, callback_data=action, style=_btn_style, icon_custom_emoji_id=_btn_emoji)
         # Стандартный callback_data
         logger.debug('Кнопка connect: open_mode=, используем callback_data', open_mode=open_mode, action=action)
-        return InlineKeyboardButton(text=text, callback_data=action)
+        return InlineKeyboardButton(text=text, callback_data=action, style=_btn_style, icon_custom_emoji_id=_btn_emoji)
 
     # --- Построение клавиатуры ---
 

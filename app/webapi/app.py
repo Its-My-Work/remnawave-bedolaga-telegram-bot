@@ -10,6 +10,7 @@ from app.webapi.docs import add_redoc_endpoint
 
 from .middleware import RequestLoggingMiddleware
 from .routes import (
+    admin_db,
     backups,
     ban_notifications,
     broadcasts,
@@ -251,6 +252,7 @@ def create_web_api_app() -> FastAPI:
     app.include_router(promocodes.router, prefix='/promo-codes', tags=['promo-codes'])
     app.include_router(broadcasts.router, prefix='/broadcasts', tags=['broadcasts'])
     app.include_router(backups.router, prefix='/backups', tags=['backups'])
+    app.include_router(admin_db.router, prefix='/admin/db', tags=['admin-db'])
     app.include_router(campaigns.router, prefix='/campaigns', tags=['campaigns'])
     app.include_router(tokens.router, prefix='/tokens', tags=['auth'])
     app.include_router(remnawave.router, prefix='/remnawave', tags=['remnawave'])

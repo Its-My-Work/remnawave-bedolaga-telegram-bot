@@ -394,7 +394,11 @@ async def process_referral_topup(db: AsyncSession, user_id: int, topup_amount_ko
                     )
 
             commission_amount = int(topup_amount_kopeks * commission_percent / 100)
-            inviter_bonus = settings.REFERRAL_INVITER_BONUS_KOPEKS + commission_amount
+            # If first topup inviter percent is set, use it; otherwise use fixed amount or commission (whichever is greater)
+            if settings.REFERRAL_FIRST_TOPUP_INVITER_PERCENT > 0:
+                inviter_bonus = int(topup_amount_kopeks * settings.REFERRAL_FIRST_TOPUP_INVITER_PERCENT / 100)
+            else:
+                inviter_bonus = max(settings.REFERRAL_INVITER_BONUS_KOPEKS, commission_amount)
 
             if inviter_bonus > 0:
                 balance_ok = await add_user_balance(

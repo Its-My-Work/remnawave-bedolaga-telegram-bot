@@ -137,6 +137,7 @@ class TransactionType(Enum):
     REFERRAL_REWARD = 'referral_reward'
     POLL_REWARD = 'poll_reward'
     GIFT_PAYMENT = 'gift_payment'
+    PURCHASE = 'purchase'
 
 
 class PromoCodeType(Enum):
@@ -185,6 +186,7 @@ class WheelPrizeType(Enum):
     TRAFFIC_GB = 'traffic_gb'
     PROMOCODE = 'promocode'
     NOTHING = 'nothing'
+    REFERRAL_BOOST = 'referral_boost'
 
 
 class WheelSpinPaymentType(Enum):
@@ -1242,6 +1244,8 @@ class User(Base):
     auto_promo_group_assigned = Column(Boolean, nullable=False, default=False)
     auto_promo_group_threshold_kopeks = Column(BigInteger, nullable=False, default=0)
     referral_commission_percent = Column(Integer, nullable=True)
+    referral_multiplier = Column(Integer, nullable=True)  # x2, x3 etc
+    referral_multiplier_expires_at = Column(AwareDateTime(), nullable=True)
     promo_offer_discount_percent = Column(Integer, nullable=False, default=0)
     promo_offer_discount_source = Column(String(100), nullable=True)
     promo_offer_discount_expires_at = Column(AwareDateTime(), nullable=True)

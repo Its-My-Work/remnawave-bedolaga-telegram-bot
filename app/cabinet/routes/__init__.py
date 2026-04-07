@@ -63,6 +63,7 @@ from .ticket_notifications import (
 from .tickets import router as tickets_router
 from .websocket import router as websocket_router
 from .wheel import router as wheel_router
+from .mtproxy import router as mtproxy_router
 from .withdrawal import router as withdrawal_router
 
 
@@ -96,6 +97,7 @@ router.include_router(news_router)
 
 # Wheel routes
 router.include_router(wheel_router)
+router.include_router(mtproxy_router)
 
 # Gift routes
 router.include_router(gift_router)

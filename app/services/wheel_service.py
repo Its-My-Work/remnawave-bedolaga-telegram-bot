@@ -52,6 +52,7 @@ class SpinResult:
     rotation_degrees: float = 0.0
     message: str = ''
     promocode: str | None = None
+    promocode_valid_until: str | None = None
     error: str | None = None
 
 
@@ -90,8 +91,11 @@ class FortuneWheelService:
         """Проверить доступность спина для пользователя."""
         config = await get_or_create_wheel_config(db)
 
+        # Admin bypass — безлимитные спины без оплаты
+        is_admin_user = settings.is_admin(telegram_id=user.telegram_id)
+
         # Колесо выключено
-        if not config.is_enabled:
+        if not config.is_enabled and not is_admin_user:
             return SpinAvailability(
                 can_spin=False,
                 reason='wheel_disabled',
@@ -101,7 +105,7 @@ class FortuneWheelService:
         spins_today = await get_user_spins_today(db, user.id)
         spins_remaining = config.daily_spin_limit - spins_today if config.daily_spin_limit > 0 else 999
 
-        if config.daily_spin_limit > 0 and spins_today >= config.daily_spin_limit:
+        if config.daily_spin_limit > 0 and spins_today >= config.daily_spin_limit and not is_admin_user:
             return SpinAvailability(
                 can_spin=False,
                 reason='daily_limit_reached',
@@ -152,7 +156,7 @@ class FortuneWheelService:
                 # For backward compat: use best subscription's days
                 user_subscription_days = max(s.days_left for s in eligible_subs)
 
-        if not can_pay_stars and not can_pay_days:
+        if not can_pay_stars and not can_pay_days and not is_admin_user:
             # Определяем причину
             reason = 'no_payment_method_available'
             if config.spin_cost_stars_enabled and user.balance_kopeks < required_balance_kopeks:
@@ -181,9 +185,9 @@ class FortuneWheelService:
 
         return SpinAvailability(
             can_spin=True,
-            spins_remaining_today=spins_remaining,
+            spins_remaining_today=999 if is_admin_user else spins_remaining,
             can_pay_stars=can_pay_stars,
-            can_pay_days=can_pay_days,
+            can_pay_days=True if is_admin_user else can_pay_days,
             min_subscription_days=config.min_subscription_days_for_day_payment,
             user_subscription_days=user_subscription_days,
             user_balance_kopeks=user.balance_kopeks,
@@ -534,6 +538,24 @@ class FortuneWheelService:
             logger.info('🎟️ Сгенерирован промокод для user_id', code=promocode.code, user_id=user.id)
             return promocode.code
 
+        if prize_type == WheelPrizeType.REFERRAL_BOOST.value:
+            # Удвоение реферальной комиссии на N дней
+            multiplier = prize.prize_value if prize.prize_value > 1 else 2
+            duration_days = prize.promo_subscription_days if prize.promo_subscription_days > 0 else 7
+            expires_at = datetime.now(UTC) + timedelta(days=duration_days)
+
+            user.referral_multiplier = multiplier
+            user.referral_multiplier_expires_at = expires_at
+
+            logger.info(
+                '🚀 Установлен множитель реферальной комиссии',
+                user_id=user.id,
+                multiplier=multiplier,
+                duration_days=duration_days,
+                expires_at=str(expires_at),
+            )
+            return None
+
         return None
 
     async def _generate_prize_promocode(
@@ -599,6 +621,8 @@ class FortuneWheelService:
                     message='Призы не настроены',
                 )
 
+            is_admin_user = settings.is_admin(telegram_id=user.telegram_id)
+
             # Resolve target subscription for days payment and prize application
             target_subscription = None
             if subscription_id:
@@ -628,7 +652,12 @@ class FortuneWheelService:
                 )
 
             # 2. Обрабатываем оплату
-            if payment_type == WheelSpinPaymentType.TELEGRAM_STARS.value:
+            if is_admin_user:
+                # Админ крутит бесплатно
+                payment_amount = 0
+                payment_value_kopeks = 0
+                logger.info('🔑 Admin spin — бесплатно, без записи в статистику', user_id=user.id)
+            elif payment_type == WheelSpinPaymentType.TELEGRAM_STARS.value:
                 if not availability.can_pay_stars:
                     return SpinResult(
                         success=False,
@@ -653,8 +682,42 @@ class FortuneWheelService:
                     message='Неверный способ оплаты',
                 )
 
+            # 2.5. Фильтруем недоступные призы (одноразовые)
+            filtered_prizes = list(prizes)
+            excluded_prize_ids = set()
+
+            # Реферал-буст: исключаем если уже активен
+            multiplier = getattr(user, 'referral_multiplier', None)
+            multiplier_expires = getattr(user, 'referral_multiplier_expires_at', None)
+            if multiplier and multiplier > 1:
+                if multiplier_expires is None or multiplier_expires > datetime.now(UTC):
+                    for p in prizes:
+                        if p.prize_type == WheelPrizeType.REFERRAL_BOOST.value:
+                            excluded_prize_ids.add(p.id)
+                    logger.info('🎫 Реферал-буст исключён (уже активен)', user_id=user.id)
+
+            # Одноразовые призы: subscription_days >= 30
+            one_time_prize_ids = set()
+            for p in prizes:
+                if p.prize_value >= 30 and p.prize_type == 'subscription_days':
+                    one_time_prize_ids.add(p.id)
+
+            if one_time_prize_ids:
+                from sqlalchemy import text as sa_text
+                won_ids_result = await db.execute(
+                    sa_text('SELECT DISTINCT prize_id FROM wheel_spins WHERE user_id = :uid AND prize_id = ANY(:pids)'),
+                    {'uid': user.id, 'pids': list(one_time_prize_ids)}
+                )
+                already_won_ids = {row[0] for row in won_ids_result.fetchall()}
+                if already_won_ids:
+                    excluded_prize_ids.update(already_won_ids)
+                    logger.info('🏆 Одноразовые призы исключены (уже выиграны)', user_id=user.id, prize_ids=list(already_won_ids))
+
+            if excluded_prize_ids:
+                filtered_prizes = [p for p in prizes if p.id not in excluded_prize_ids]
+
             # 3. Рассчитываем вероятности и выбираем приз
-            prizes_with_probs = self.calculate_prize_probabilities(config, prizes, payment_value_kopeks)
+            prizes_with_probs = self.calculate_prize_probabilities(config, filtered_prizes, payment_value_kopeks)
             selected_prize = self._select_prize(prizes_with_probs)
 
             # 4. Рассчитываем угол для анимации
@@ -674,21 +737,34 @@ class FortuneWheelService:
                 if row:
                     promocode_id = row[0]
 
-            # 6. Создаем запись спина
-            await create_wheel_spin(
-                db=db,
-                user_id=user.id,
-                prize_id=selected_prize.id,
-                payment_type=payment_type,
-                payment_amount=payment_amount,
-                payment_value_kopeks=payment_value_kopeks,
-                prize_type=selected_prize.prize_type,
-                prize_value=selected_prize.prize_value,
-                prize_display_name=selected_prize.display_name,
-                prize_value_kopeks=selected_prize.prize_value_kopeks,
-                generated_promocode_id=promocode_id,
-                is_applied=True,
-            )
+            # 5.5 Получаем срок годности промокода
+            promocode_valid_until = None
+            if generated_promocode:
+                from sqlalchemy import text as sa_text2
+                vu_result = await db.execute(
+                    sa_text2('SELECT valid_until FROM promocodes WHERE code = :code'),
+                    {'code': generated_promocode}
+                )
+                vu_row = vu_result.fetchone()
+                if vu_row and vu_row[0]:
+                    promocode_valid_until = vu_row[0].isoformat()
+
+            # 6. Создаем запись спина (пропускаем для админа)
+            if not is_admin_user:
+                await create_wheel_spin(
+                    db=db,
+                    user_id=user.id,
+                    prize_id=selected_prize.id,
+                    payment_type=payment_type,
+                    payment_amount=payment_amount,
+                    payment_value_kopeks=payment_value_kopeks,
+                    prize_type=selected_prize.prize_type,
+                    prize_value=selected_prize.prize_value,
+                    prize_display_name=selected_prize.display_name,
+                    prize_value_kopeks=selected_prize.prize_value_kopeks,
+                    generated_promocode_id=promocode_id,
+                    is_applied=True,
+                )
 
             await db.commit()
 
@@ -706,6 +782,7 @@ class FortuneWheelService:
                 rotation_degrees=rotation,
                 message=message,
                 promocode=generated_promocode,
+                promocode_valid_until=promocode_valid_until,
             )
 
         except ValueError as e:
@@ -754,6 +831,11 @@ class FortuneWheelService:
 
         if prize_type == WheelPrizeType.PROMOCODE.value:
             return f'Поздравляем! Ваш промокод: {promocode}'
+
+        if prize_type == WheelPrizeType.REFERRAL_BOOST.value:
+            multiplier = prize.prize_value if prize.prize_value > 1 else 2
+            duration_days = prize.promo_subscription_days if prize.promo_subscription_days > 0 else 7
+            return f'Поздравляем! Реферальный бонус x{multiplier} на {duration_days} дней!'
 
         return 'Поздравляем с выигрышем!'
 

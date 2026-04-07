@@ -1314,6 +1314,57 @@ class AdminNotificationService:
             return False
         return await self._send_message(text, reply_markup=reply_markup, category=category)
 
+
+    async def send_mtproxy_purchase_notification(
+        self,
+        user: User,
+        qty: int,
+        total_kopeks: int,
+        *,
+        is_gift: bool = False,
+        gift_recipient_name: str | None = None,
+        gift_recipient_id: int | None = None,
+    ) -> bool:
+        """Send admin notification for MTProxy purchase/gift."""
+        if not self._is_enabled():
+            return False
+
+        try:
+            now_str = format_local_datetime(datetime.now(UTC))
+            price_str = f'{abs(total_kopeks) / 100:.2f} ₽'
+
+            if is_gift:
+                title = '🎁 ПОДАРОК ПРОКСИ'
+                recipient_line = f'🎯 Получатель: <b>{html.escape(gift_recipient_name or "—")}</b> (ID: {gift_recipient_id})'
+            else:
+                title = '🛡 ПОКУПКА ПРОКСИ'
+                recipient_line = ''
+
+            user_name = html.escape(user.first_name or '—')
+            username_str = f'@{html.escape(user.username)}' if user.username else '—'
+
+            text = (
+                f'<b>{title}</b>\n\n'
+                f'👤 {user_name} ({user.telegram_id})\n'
+                f'📱 {username_str}\n'
+            )
+            if recipient_line:
+                text += f'{recipient_line}\n'
+            text += (
+                f'\n'
+                f'📦 Количество: <b>{qty}</b>\n'
+                f'💵 <b>{price_str}</b>\n'
+                f'💰 Баланс: {user.balance_kopeks / 100:.2f} ₽\n'
+                f'\n'
+                f'<i>{now_str}</i>'
+            )
+
+            return await self._send_message(text, category=NotificationCategory.PURCHASES)
+
+        except Exception as e:
+            logger.error('Ошибка отправки уведомления о покупке прокси', error=e)
+            return False
+
     async def send_guest_purchase_notification(
         self,
         purchase: GuestPurchase,

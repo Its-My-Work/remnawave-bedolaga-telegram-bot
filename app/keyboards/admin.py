@@ -71,6 +71,12 @@ def get_admin_main_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
                     callback_data='admin_payments',
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text='🔒 MTProxy',
+                    callback_data='admin_mtproxy',
+                ),
+            ],
             [InlineKeyboardButton(text=texts.BACK, callback_data='back_to_menu')],
         ]
     )

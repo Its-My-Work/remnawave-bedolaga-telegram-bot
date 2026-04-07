@@ -20,7 +20,6 @@ from app.cabinet.schemas.wheel import (
     WheelConfigResponse,
     WheelPrizeDisplay,
 )
-from app.config import settings
 from app.database.crud.wheel import (
     get_or_create_wheel_config,
     get_user_spin_history,
@@ -49,23 +48,39 @@ async def get_wheel_config(
     # Проверяем доступность
     availability = await wheel_service.check_availability(db, user)
 
-    # Проверяем наличие подписки (multi-tariff aware)
-    if settings.is_multi_tariff_enabled():
-        from app.database.crud.subscription import get_active_subscriptions_by_user_id
+    # Проверяем наличие подписки
+    from app.database.crud.subscription import get_subscription_by_user_id
 
-        active_subs = await get_active_subscriptions_by_user_id(db, user.id)
-        # Check if user has any active subscription for wheel access
-        if active_subs:
-            _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
-            _pool = _non_daily or active_subs
-            subscription = max(_pool, key=lambda s: s.days_left)
-        else:
-            subscription = None
-    else:
-        from app.database.crud.subscription import get_subscription_by_user_id
-
-        subscription = await get_subscription_by_user_id(db, user.id)
+    subscription = await get_subscription_by_user_id(db, user.id)
     has_subscription = subscription is not None and subscription.is_active
+
+    # Получаем статистику выигрышей для текущего пользователя
+    from sqlalchemy import text
+    from datetime import UTC, datetime
+    from app.database.models import WheelPrizeType
+
+    win_counts_result = await db.execute(
+        text('SELECT prize_id, COUNT(*) as cnt FROM wheel_spins WHERE user_id = :uid GROUP BY prize_id'),
+        {'uid': user.id}
+    )
+    win_counts = {row[0]: row[1] for row in win_counts_result.fetchall()}
+
+    # Определяем заблокированные призы
+    locked_prize_ids = set()
+
+    # Одноразовые призы: subscription_days >= 30 (Месяц, Джекпот)
+    for p in prizes:
+        if p.prize_value >= 30 and p.prize_type == 'subscription_days' and p.id in win_counts:
+            locked_prize_ids.add(p.id)
+
+    # Реферал-буст: заблокирован если уже активен
+    multiplier = getattr(user, 'referral_multiplier', None)
+    multiplier_expires = getattr(user, 'referral_multiplier_expires_at', None)
+    if multiplier and multiplier > 1:
+        if multiplier_expires is None or multiplier_expires > datetime.now(UTC):
+            for p in prizes:
+                if p.prize_type == WheelPrizeType.REFERRAL_BOOST.value:
+                    locked_prize_ids.add(p.id)
 
     prizes_display = [
         WheelPrizeDisplay(
@@ -74,17 +89,11 @@ async def get_wheel_config(
             emoji=p.emoji,
             color=p.color,
             prize_type=p.prize_type,
+            win_count=win_counts.get(p.id, 0),
+            is_locked=p.id in locked_prize_ids,
         )
         for p in prizes
     ]
-
-    # Build eligible subscriptions for frontend picker
-    eligible_subs_display = None
-    if availability.eligible_subscriptions:
-        eligible_subs_display = [
-            {'id': s.id, 'tariff_name': s.tariff_name, 'days_left': s.days_left}
-            for s in availability.eligible_subscriptions
-        ]
 
     return WheelConfigResponse(
         is_enabled=config.is_enabled,
@@ -103,7 +112,7 @@ async def get_wheel_config(
         user_balance_kopeks=availability.user_balance_kopeks,
         required_balance_kopeks=availability.required_balance_kopeks,
         has_subscription=has_subscription,
-        eligible_subscriptions=eligible_subs_display,
+        user_subscription_days=availability.user_subscription_days,
     )
 
 
@@ -135,7 +144,7 @@ async def spin_wheel(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Крутить колесо удачи."""
-    result = await wheel_service.spin(db, user, request.payment_type.value, subscription_id=request.subscription_id)
+    result = await wheel_service.spin(db, user, request.payment_type.value)
 
     if not result.success:
         # Возвращаем ошибку в теле ответа, а не HTTP exception
@@ -156,6 +165,7 @@ async def spin_wheel(
         rotation_degrees=result.rotation_degrees,
         message=result.message,
         promocode=result.promocode,
+        promocode_valid_until=result.promocode_valid_until if hasattr(result, 'promocode_valid_until') else None,
     )
 
 
@@ -240,22 +250,10 @@ async def create_stars_invoice(
             detail='Оплата Stars не включена',
         )
 
-    # Проверяем наличие активной подписки (multi-tariff aware)
-    if settings.is_multi_tariff_enabled():
-        from app.database.crud.subscription import get_active_subscriptions_by_user_id
+    # Проверяем наличие активной подписки
+    from app.database.crud.subscription import get_subscription_by_user_id
 
-        active_subs = await get_active_subscriptions_by_user_id(db, user.id)
-        # Check if user has any active subscription for Stars invoice
-        if active_subs:
-            _non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
-            _pool = _non_daily or active_subs
-            subscription = max(_pool, key=lambda s: s.days_left)
-        else:
-            subscription = None
-    else:
-        from app.database.crud.subscription import get_subscription_by_user_id
-
-        subscription = await get_subscription_by_user_id(db, user.id)
+    subscription = await get_subscription_by_user_id(db, user.id)
     if not subscription or not subscription.is_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

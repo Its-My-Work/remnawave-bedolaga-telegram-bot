@@ -300,6 +300,17 @@ async def fulfill_purchase(
         return purchase
 
     try:
+        # === LINK MODE: no recipient yet, just mark as PENDING_ACTIVATION ===
+        if purchase.gift_recipient_type == 'link':
+            purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
+            await db.commit()
+            logger.info(
+                'Gift link purchase set to PENDING_ACTIVATION (awaiting deep link activation)',
+                purchase_id=purchase.id,
+                token_prefix=purchase_token[:5],
+            )
+            return purchase
+
         # Determine recipient contact info
         recipient_type, recipient_value = _get_recipient_contact(purchase)
 
@@ -1067,18 +1078,32 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
         else:
             existing_subscription = await get_subscription_by_user_id(db, user.id)
             if existing_subscription is not None:
-                subscription = await replace_subscription(
-                    db,
-                    existing_subscription,
-                    duration_days=purchase.period_days,
-                    traffic_limit_gb=tariff.traffic_limit_gb,
-                    device_limit=tariff.device_limit,
-                    connected_squads=squads,
-                    is_trial=False,
-                    update_server_counters=True,
-                    commit=False,
-                )
-                subscription.tariff_id = tariff.id
+                # If gift and subscription is active — EXTEND (add days), not replace
+                from app.database.crud.subscription import extend_subscription
+                if purchase.is_gift and existing_subscription.end_date and existing_subscription.end_date > datetime.now(UTC):
+                    subscription = await extend_subscription(
+                        db,
+                        existing_subscription,
+                        days=purchase.period_days,
+                        tariff_id=tariff.id,
+                        traffic_limit_gb=tariff.traffic_limit_gb,
+                        device_limit=tariff.device_limit,
+                        connected_squads=squads,
+                        commit=False,
+                    )
+                else:
+                    subscription = await replace_subscription(
+                        db,
+                        existing_subscription,
+                        duration_days=purchase.period_days,
+                        traffic_limit_gb=tariff.traffic_limit_gb,
+                        device_limit=tariff.device_limit,
+                        connected_squads=squads,
+                        is_trial=False,
+                        update_server_counters=True,
+                        commit=False,
+                    )
+                    subscription.tariff_id = tariff.id
             else:
                 subscription = await create_paid_subscription(
                     db=db,

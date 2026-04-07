@@ -7,6 +7,8 @@ from aiogram.fsm.storage.redis import RedisStorage
 from app.config import settings
 from app.handlers import (
     balance,
+    email_bind,
+    mtproxy,
     common,
     contests as user_contests,
     menu,
@@ -54,6 +56,7 @@ from app.handlers.admin import (
     tariffs as admin_tariffs,
     tickets as admin_tickets,
     trials as admin_trials,
+    mtproxy as admin_mtproxy,
     updates as admin_updates,
     user_messages as admin_user_messages,
     users as admin_users,
@@ -211,6 +214,7 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     admin_payments.register_handlers(dp)
     admin_trials.register_handlers(dp)
     admin_tariffs.register_handlers(dp)
+    admin_mtproxy.register_handlers(dp)
     admin_bulk_ban.register_bulk_ban_handlers(dp)
     admin_blacklist.register_blacklist_handlers(dp)
     admin_blocked_users.register_handlers(dp)
@@ -222,6 +226,8 @@ async def setup_bot() -> tuple[Bot, Dispatcher]:
     user_contests.register_handlers(dp)
     user_polls.register_handlers(dp)
     simple_subscription.register_simple_subscription_handlers(dp)
+    mtproxy.register_handlers(dp)
+    email_bind.register_handlers(dp)
     logger.info('⭐ Зарегистрированы обработчики Telegram Stars платежей')
     logger.info('⚡ Зарегистрированы обработчики простой покупки')
     logger.info('⚡ Зарегистрированы обработчики простой подписки')

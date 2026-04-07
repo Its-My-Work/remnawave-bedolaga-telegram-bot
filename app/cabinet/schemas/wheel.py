@@ -24,6 +24,7 @@ class WheelPrizeType(StrEnum):
     TRAFFIC_GB = 'traffic_gb'
     PROMOCODE = 'promocode'
     NOTHING = 'nothing'
+    REFERRAL_BOOST = 'referral_boost'
 
 
 # ==================== USER SCHEMAS ====================
@@ -37,6 +38,8 @@ class WheelPrizeDisplay(BaseModel):
     emoji: str
     color: str
     prize_type: str
+    win_count: int = 0
+    is_locked: bool = False
 
     class Config:
         from_attributes = True
@@ -61,7 +64,7 @@ class WheelConfigResponse(BaseModel):
     user_balance_kopeks: int = 0
     required_balance_kopeks: int = 0
     has_subscription: bool = False
-    eligible_subscriptions: list[dict] | None = None
+    user_subscription_days: int = 0
 
 
 class SpinAvailabilityResponse(BaseModel):
@@ -82,7 +85,6 @@ class SpinRequest(BaseModel):
     """Запрос на спин."""
 
     payment_type: WheelPaymentType
-    subscription_id: int | None = None
 
 
 class SpinResultResponse(BaseModel):
@@ -98,6 +100,7 @@ class SpinResultResponse(BaseModel):
     rotation_degrees: float = 0.0
     message: str = ''
     promocode: str | None = None
+    promocode_valid_until: str | None = None
     error: str | None = None
 
 

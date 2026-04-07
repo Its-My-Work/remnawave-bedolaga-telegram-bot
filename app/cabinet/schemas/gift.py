@@ -45,15 +45,13 @@ class GiftConfigResponse(BaseModel):
     payment_methods: list[GiftConfigPaymentMethod] = []
     balance_kopeks: int = 0
     currency_symbol: str = '\u20bd'
-    promo_group_name: str | None = None
-    active_discount_percent: int | None = None
-    active_discount_expires_at: datetime | None = None
+    bot_username: str | None = None
 
 
 class GiftPurchaseRequest(BaseModel):
     tariff_id: int = Field(gt=0)
     period_days: int = Field(gt=0, le=3650)
-    recipient_type: str | None = Field(default=None, pattern=r'^(email|telegram)$')
+    recipient_type: str = Field(pattern=r'^(email|telegram|link)$')
     recipient_value: str | None = Field(default=None, max_length=255)
     gift_message: str | None = Field(default=None, max_length=1000)
     payment_mode: str = Field(pattern=r'^(balance|gateway)$')
@@ -63,6 +61,10 @@ class GiftPurchaseRequest(BaseModel):
     def validate_payment(self) -> GiftPurchaseRequest:
         if self.payment_mode == 'gateway' and not self.payment_method:
             raise ValueError('payment_method is required for gateway mode')
+        if self.recipient_type != 'link' and not self.recipient_value:
+            raise ValueError('recipient_value is required for email and telegram delivery')
+        if self.recipient_type == 'link' and self.recipient_value:
+            raise ValueError('recipient_value must be empty for link delivery')
         return self
 
 
@@ -70,18 +72,18 @@ class GiftPurchaseResponse(BaseModel):
     status: str
     purchase_token: str
     payment_url: str | None = None
+    gift_link: str | None = None
     warning: str | None = None
 
 
 class GiftPurchaseStatusResponse(BaseModel):
     status: str
     is_gift: bool = True
-    is_code_only: bool = False
-    purchase_token: str | None = None
     recipient_contact_value: str | None = None
     gift_message: str | None = None
     tariff_name: str | None = None
     period_days: int | None = None
+    gift_link: str | None = None
     warning: str | None = None
 
 
@@ -95,37 +97,14 @@ class PendingGiftResponse(BaseModel):
 
 
 class SentGiftResponse(BaseModel):
-    """A gift the current user has sent."""
-
     token: str
+    status: str
     tariff_name: str | None = None
     period_days: int
-    device_limit: int = 1
-    status: str
+    gift_recipient_type: str | None = None
     gift_recipient_value: str | None = None
     gift_message: str | None = None
+    gift_link: str | None = None
     activated_by_username: str | None = None
     created_at: datetime | None = None
-
-
-class ReceivedGiftResponse(BaseModel):
-    """A gift the current user has received."""
-
-    token: str
-    tariff_name: str | None = None
-    period_days: int
-    device_limit: int = 1
-    status: str
-    sender_display: str | None = None
-    gift_message: str | None = None
-    created_at: datetime | None = None
-
-
-class ActivateGiftRequest(BaseModel):
-    code: str = Field(min_length=1, max_length=100)
-
-
-class ActivateGiftResponse(BaseModel):
-    status: str
-    tariff_name: str | None = None
-    period_days: int | None = None
+    delivered_at: datetime | None = None

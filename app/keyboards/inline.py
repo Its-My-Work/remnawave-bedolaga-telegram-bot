@@ -134,6 +134,7 @@ async def get_main_menu_keyboard_async(
             registration_days=registration_days,
             promo_group_id=promo_group_id,
             has_autopay=has_autopay,
+            has_email=bool(user and hasattr(user, "email") and user.email and hasattr(user, "email_verified") and user.email_verified),
         )
 
         return await MenuLayoutService.build_keyboard(db, context)
@@ -470,6 +471,21 @@ def _build_cabinet_main_menu_keyboard(
                     )
                     row_buttons.append(_cabinet_button(home_text, '/', 'menu_profile_unavailable'))
 
+                case 'mtproxy':
+                    if not section_cfg.get('enabled', True):
+                        continue
+                    mtproxy_text = section_cfg.get('labels', {}).get(language, '') or '🛡 Прокси для Telegram'
+                    resolved_mtproxy_style = _resolve_style(section_cfg.get('style'))
+                    resolved_mtproxy_emoji = section_cfg.get('icon_custom_emoji_id') or None
+                    row_buttons.append(
+                        InlineKeyboardButton(
+                            text=mtproxy_text,
+                            callback_data='menu_mtproxy',
+                            style=resolved_mtproxy_style or global_style,
+                            icon_custom_emoji_id=resolved_mtproxy_emoji,
+                        )
+                    )
+
                 case 'subscription':
                     if not section_cfg.get('enabled', True):
                         continue
@@ -751,6 +767,14 @@ def get_main_menu_keyboard(
     # Добавляем кнопку активации
     if settings.ACTIVATE_BUTTON_VISIBLE:
         paired_buttons.append(InlineKeyboardButton(text=settings.ACTIVATE_BUTTON_TEXT, callback_data='activate_button'))
+
+    # MTProxy button
+    paired_buttons.append(
+        InlineKeyboardButton(
+            text='🔒 Telegram Proxy',
+            callback_data='menu_mtproxy',
+        )
+    )
 
     paired_buttons.append(
         InlineKeyboardButton(
@@ -1755,23 +1779,10 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
         )
         has_direct_payment_methods = True
 
-    if settings.is_kassa_ai_sberpay_enabled():
-        sberpay_name = settings.get_kassa_ai_sberpay_display_name()
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    text=texts.t('PAYMENT_KASSA_AI_SBERPAY', f'💳 {sberpay_name}'),
-                    callback_data=_build_callback('kassa_ai_sberpay'),
-                )
-            ]
-        )
-        has_direct_payment_methods = True
-
     if (
         settings.is_kassa_ai_enabled()
         and not settings.is_kassa_ai_sbp_enabled()
         and not settings.is_kassa_ai_card_enabled()
-        and not settings.is_kassa_ai_sberpay_enabled()
     ):
         kassa_ai_name = settings.get_kassa_ai_display_name()
         keyboard.append(
