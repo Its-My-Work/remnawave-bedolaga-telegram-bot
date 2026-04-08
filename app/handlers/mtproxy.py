@@ -36,6 +36,10 @@ async def _get_mtproxy_settings(db: AsyncSession) -> dict:
     token = await get_setting_value(db, MTPROXY_API_TOKEN_KEY) or ''
     price_raw = await get_setting_value(db, MTPROXY_PRICE_30D_KEY) or '4900'
     enabled = (await get_setting_value(db, MTPROXY_ENABLED_KEY) or 'true').lower() == 'true'
+    
+    # ДЛЯ ОТЛАДКИ — УДАЛИ ПОСЛЕ
+    print(f"[DEBUG] MTPROXY: url='{url}', token='{token[:10]}...' if token else None, enabled={enabled}")
+    
     try:
         price = int(price_raw)
     except ValueError:
