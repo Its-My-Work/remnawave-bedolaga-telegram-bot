@@ -31,19 +31,25 @@ async def _get_cfg(db: AsyncSession) -> dict:
 
 
 async def _api(method: str, path: str, cfg: dict, json_data: dict | None = None) -> dict | None:
-    try:
-        async with aiohttp.ClientSession() as session:
-            headers = {'Authorization': f'Bearer {cfg["token"]}', 'Content-Type': 'application/json'}
-            url = f'{cfg["url"]}{path}'
-            kw = {'headers': headers, 'timeout': aiohttp.ClientTimeout(total=10)}
-            if method == 'GET':
-                async with session.get(url, **kw) as resp:
-                    return await resp.json() if resp.status == 200 else None
-            else:
-                async with session.post(url, json=json_data, **kw) as resp:
-                    return await resp.json() if resp.status == 200 else None
-    except Exception as e:
-        logger.error('MTProxy API error', error=str(e))
+    import asyncio
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {'Authorization': f'Bearer {cfg["token"]}', 'Content-Type': 'application/json'}
+                url = f'{cfg["url"]}{path}'
+                kw = {'headers': headers, 'timeout': aiohttp.ClientTimeout(total=10)}
+                if method == 'GET':
+                    async with session.get(url, **kw) as resp:
+                        return await resp.json() if resp.status == 200 else None
+                else:
+                    async with session.post(url, json=json_data, **kw) as resp:
+                        return await resp.json() if resp.status == 200 else None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)  # Задержка 2 секунды перед повторной попыткой
+                continue
+            logger.warning('MTProxy API недоступен после 3 попыток', error=str(e), url=url)
     return None
 
 
