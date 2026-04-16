@@ -127,7 +127,7 @@ class EmailService:
             msg.attach(part2)
 
             with self._get_smtp_connection() as smtp:
-                smtp.sendmail(safe_from_email, to_email, msg.as_bytes())
+                smtp.sendmail(safe_from_email, to_email, msg.as_string())
 
             logger.info('Email sent successfully to', to_email=to_email)
             return True
